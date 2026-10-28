@@ -13,7 +13,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('baseline','display','performance','crash','network','audio','storage','usb','boot','all')]
+    # Comma-separated list; accepted as one string too, because "powershell -File" passes it that way.
     [string[]]$Category = @('baseline'),
 
     [ValidateRange(1,90)]
@@ -24,6 +24,14 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 $since     = (Get-Date).AddDays(-$Days)
 $sinceLong = (Get-Date).AddDays(-([Math]::Max($Days, 30)))
+
+$validCategories = @('baseline','display','performance','crash','network','audio','storage','usb','boot','all')
+$Category = @($Category | ForEach-Object { $_ -split '[,;\s]+' } | Where-Object { $_ } | ForEach-Object { $_.Trim().ToLower() } | Select-Object -Unique)
+$unknown  = @($Category | Where-Object { $_ -notin $validCategories })
+if ($unknown.Count -gt 0) {
+    Write-Output "Unknown category: $($unknown -join ', '). Valid: $($validCategories -join ', ')"
+    exit 1
+}
 
 if ($Category -contains 'all') {
     $Category = @('baseline','display','performance','crash','network','audio','storage','usb','boot')
