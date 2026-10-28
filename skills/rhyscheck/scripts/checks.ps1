@@ -40,11 +40,17 @@ function Run([string]$Label, [scriptblock]$Block) {
         if ([string]::IsNullOrWhiteSpace($out)) { "   (none found)" } else { $out.TrimEnd() }
     } catch {
         $msg = $_.Exception.Message
-        if ($msg -match 'denied|privilege|unauthori|elevat') { "   needs admin" } else { "   error: $msg" }
+        if ($msg -match 'No events were found') { "   (none found)" }
+        elseif ($msg -match 'denied|privilege|unauthori|elevat|CIM resource was not available') { "   needs admin" }
+        else { "   error: $msg" }
     }
 }
 
-function FirstLine($Text) { if ($Text) { (($Text -split "`r?`n")[0]).Trim() } }
+function FirstLine($Text) { if ($Text) { (($Text -split "`r?`n")[0]).Trim() } else { '(no message text)' } }
+
+function Short-Location($Loc) {
+    $Loc -replace '^HKU\\S-1-5-21-[\d-]+\\', 'HKCU\' -replace '^HKU\\(S-1-5-18|\.DEFAULT)\\', 'HKU-System\' -replace '\\Microsoft\\Windows\\CurrentVersion\\Run$', '\Run'
+}
 
 function Get-Events([hashtable]$Filter, [int]$Max = 20) {
     Get-WinEvent -FilterHashtable $Filter -MaxEvents $Max -ErrorAction SilentlyContinue |
@@ -116,7 +122,7 @@ switch ($cat) {
     Run 'Monitors' {
         $names = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorID -ErrorAction SilentlyContinue)
         $conns = @(Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorConnectionParams -ErrorAction SilentlyContinue)
-        $map = @{ 0='VGA'; 4='DVI'; 5='HDMI'; 10='DisplayPort'; 11='DisplayPort (internal)'; 2147483648='Internal panel' }
+        $map = @{ '0'='VGA'; '4'='DVI'; '5'='HDMI'; '10'='DisplayPort'; '11'='DisplayPort (internal)'; '15'='Miracast'; '2147483648'='Internal panel' }
         foreach ($m in $names) {
             $c = $conns | Where-Object { $_.InstanceName -eq $m.InstanceName } | Select-Object -First 1
             $tech = if ($c) { [int64]$c.VideoOutputTechnology } else { $null }
@@ -124,12 +130,14 @@ switch ($cat) {
                 Monitor    = Decode-WmiString $m.UserFriendlyName
                 Maker      = Decode-WmiString $m.ManufacturerName
                 Year       = $m.YearOfManufacture
-                Connection = if ($null -ne $tech -and $map.ContainsKey($tech)) { $map[$tech] } elseif ($null -ne $tech) { "Other ($tech)" } else { '?' }
+                Connection = if ($null -ne $tech -and $map.ContainsKey("$tech")) { $map["$tech"] } elseif ($null -ne $tech) { "Other ($tech)" } else { '?' }
                 Active     = $m.Active
             }
         }
     }
-    Run 'Monitor devices' { Get-PnpDevice -Class Monitor -ErrorAction SilentlyContinue | Select-Object FriendlyName, Status | Format-Table -AutoSize }
+    Run 'Connected monitor devices' {
+        Get-PnpDevice -Class Monitor -PresentOnly -ErrorAction SilentlyContinue | Select-Object FriendlyName, Status | Format-Table -AutoSize
+    }
     Run "GPU / display driver events (last $Days days)" {
         Get-WinEvent -FilterHashtable @{ LogName='System'; Level=1,2,3; StartTime=$since } -MaxEvents 5000 -ErrorAction SilentlyContinue |
             Where-Object { $_.ProviderName -match 'nvlddmkm|amdkmdag|amdwddmg|igfx|^Display$|DxgKrnl|dxgkrnl' -or $_.Id -eq 4101 } |
@@ -155,7 +163,7 @@ switch ($cat) {
         Get-Process | Sort-Object WS -Descending | Select-Object -First 10 Name,
             @{n='RAM_MB'; e={ [int]($_.WS / 1MB) }} | Format-Table -AutoSize
     }
-    Run 'Startup programs' { Get-CimInstance Win32_StartupCommand | Select-Object Name, Location | Format-Table -AutoSize }
+    Run 'Startup programs' { Get-CimInstance Win32_StartupCommand | Select-Object Name, @{n='Location'; e={ Short-Location $_.Location }} | Sort-Object Name -Unique | Format-Table -AutoSize }
     Run 'Power plan' { powercfg /getactivescheme }
     Run 'Thermal zones' {
         Get-CimInstance -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop |
@@ -172,12 +180,16 @@ switch ($cat) {
         Get-Events @{ LogName='System'; ProviderName='Microsoft-Windows-WHEA-Logger'; StartTime=$sinceLong } 15 | Format-Table -AutoSize -Wrap
     }
     Run 'Minidumps' {
-        Get-ChildItem C:\Windows\Minidump -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending |
-            Select-Object -First 5 Name, LastWriteTime | Format-Table -AutoSize
+        if (-not (Test-Path C:\Windows\Minidump)) { 'No Minidump folder' }
+        else {
+            Get-ChildItem C:\Windows\Minidump -ErrorAction Stop | Sort-Object LastWriteTime -Descending |
+                Select-Object -First 5 Name, LastWriteTime | Format-Table -AutoSize
+        }
     }
     Run "App crashes and hangs (last $Days days)" {
-        Get-WinEvent -FilterHashtable @{ LogName='Application'; Id=1000,1002; StartTime=$since } -MaxEvents 200 -ErrorAction SilentlyContinue |
-            Group-Object { ($_.Properties[0].Value) } | Sort-Object Count -Descending | Select-Object -First 10 Count, Name | Format-Table -AutoSize
+        Get-WinEvent -FilterHashtable @{ LogName='Application'; ProviderName='Application Error','Application Hang'; StartTime=$since } -MaxEvents 200 -ErrorAction SilentlyContinue |
+            Group-Object { "$($_.Properties[0].Value) ($(if ($_.Id -eq 1002) { 'hang' } else { 'crash' }))" } |
+            Sort-Object Count -Descending | Select-Object -First 10 Count, Name | Format-Table -AutoSize
     }
 }
 
@@ -208,7 +220,11 @@ switch ($cat) {
 
 'audio' {
     Section 'Audio'
-    Run 'Audio devices' { Get-PnpDevice -Class AudioEndpoint, MEDIA -ErrorAction SilentlyContinue | Select-Object Class, FriendlyName, Status | Format-Table -AutoSize }
+    Run 'Audio devices (connected)' {
+        $all = @(Get-PnpDevice -Class AudioEndpoint, MEDIA -ErrorAction SilentlyContinue)
+        $all | Where-Object { $_.Status -ne 'Unknown' } | Select-Object Class, FriendlyName, Status | Sort-Object Class, FriendlyName | Format-Table -AutoSize
+        "Not currently connected: $(@($all | Where-Object Status -eq 'Unknown').Count) device(s)"
+    }
     Run 'Audio services' { Get-Service Audiosrv, AudioEndpointBuilder | Select-Object Name, Status, StartType | Format-Table -AutoSize }
 }
 
@@ -230,9 +246,16 @@ switch ($cat) {
 
 'usb' {
     Section 'USB and peripherals'
-    Run 'Peripherals' {
-        Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.Class -match 'USB|HIDClass|Keyboard|Mouse|Image|Camera|Bluetooth' } |
-            Select-Object Class, FriendlyName, Status | Sort-Object Class | Format-Table -AutoSize
+    $generic = 'Generic|Service|Profile|Enumerator|HID-compliant|HID Keyboard|USB Input|Root Hub|Composite|Avrcp|RFCOMM|GATT|Host Controller|Information|Identification|Discovery|PS/2|HID Button|Event Filter|Synthetic|Input Configuration|Portable Device|I2C HID|Bluetooth HID|XINPUT'
+    Run 'Peripherals with problems' {
+        Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+            Where-Object { $_.Class -match 'USB|HIDClass|Keyboard|Mouse|Image|Camera|Bluetooth' -and $_.Status -ne 'OK' } |
+            Select-Object Class, FriendlyName, Status | Format-Table -AutoSize
+    }
+    Run 'Connected peripherals' {
+        Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+            Where-Object { $_.Class -match 'USB|HIDClass|Keyboard|Mouse|Image|Camera|Bluetooth' -and $_.FriendlyName -notmatch $generic } |
+            Sort-Object FriendlyName -Unique | Select-Object Class, FriendlyName, Status | Sort-Object Class | Format-Table -AutoSize
     }
     Run "Device connect / disconnect events (last $Days days)" {
         Get-Events @{ LogName='System'; ProviderName='Microsoft-Windows-Kernel-PnP'; StartTime=$since } 20 | Format-Table -AutoSize -Wrap
@@ -249,7 +272,7 @@ switch ($cat) {
                 [pscustomobject]@{ Date = $_.TimeCreated; BootSeconds = [math]::Round([int]$bt / 1000, 1) }
             } | Format-Table -AutoSize
     }
-    Run 'Startup programs' { Get-CimInstance Win32_StartupCommand | Select-Object Name, Location | Format-Table -AutoSize }
+    Run 'Startup programs' { Get-CimInstance Win32_StartupCommand | Select-Object Name, @{n='Location'; e={ Short-Location $_.Location }} | Sort-Object Name -Unique | Format-Table -AutoSize }
     Run 'Fast Startup' {
         $v = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled
         if ($v -eq 1) { 'Enabled' } elseif ($v -eq 0) { 'Disabled' } else { 'Unknown' }
