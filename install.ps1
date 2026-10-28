@@ -5,7 +5,13 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$base  = 'https://raw.githubusercontent.com/Rhyyslloyd/rhyscheck/main/skills/rhyscheck'
+# Pin to the latest commit so a fresh push installs straight away (raw.githubusercontent.com caches 'main' for a few minutes).
+$ref = 'main'
+try {
+    $ref = (Invoke-RestMethod -Uri 'https://api.github.com/repos/Rhyyslloyd/rhyscheck/commits/main' -Headers @{ 'User-Agent' = 'rhyscheck-installer' } -UseBasicParsing).sha
+} catch { }
+
+$base  = "https://raw.githubusercontent.com/Rhyyslloyd/rhyscheck/$ref/skills/rhyscheck"
 $dest  = Join-Path $env:USERPROFILE '.claude\skills\rhyscheck'
 $files = @('SKILL.md', 'scripts/checks.ps1')
 
